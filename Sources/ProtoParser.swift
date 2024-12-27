@@ -11,14 +11,38 @@ struct ProtoPrinter: ParsableCommand {
         // TODO: Better error handling
         let fileURL = URL(string: "file://\((target as NSString).expandingTildeInPath)")!
         let data64 = try Data(contentsOf: fileURL, options: .mappedIfSafe)
-        
+
         // Access data via pointers for easier traversal
         data64.withUnsafeBytes { bytes in
             guard let baseAddress = bytes.baseAddress else { return }
 
-            // The mach header is at the start of the file
-            let header = baseAddress.assumingMemoryBound(to: mach_header_64.self)
-            
+            let magicNumber = baseAddress.load(as: UInt32.self)
+
+            let offset: Int
+            let size: Int
+
+            if magicNumber.bigEndian == FAT_MAGIC {
+                // Protocols conformances should be the same. Grab the first architecture
+                let entry = baseAddress
+                    .advanced(by: MemoryLayout<fat_header>.size)
+                    .assumingMemoryBound(to: fat_arch.self)
+
+                offset = Int(entry.pointee.offset.bigEndian)
+                size = Int(entry.pointee.size.bigEndian)
+            } else {
+                offset = 0
+                size = bytes.count
+            }
+
+            let header = baseAddress
+                .advanced(by: offset)
+                .assumingMemoryBound(to: mach_header_64.self)
+
+            guard header.pointee.magic == MH_MAGIC_64 else {
+                print("Unexpected header magic number: 0x\(String(header.pointee.magic, radix: 16))")
+                return
+            }
+
             // Get the header for the protocol conformance section
             let sectionHeaderPtr = getSectionHeader(
                 header: header,
@@ -26,8 +50,12 @@ struct ProtoPrinter: ParsableCommand {
                 sectionName: "__swift5_proto"
             )
             guard let sectionHeader = sectionHeaderPtr?.pointee else { return }
-            
-            printConformances(in: sectionHeader, baseAddress: baseAddress)
+
+            printConformances(
+                in: sectionHeader,
+                baseAddress: baseAddress.advanced(by: offset),
+                maxAddress: baseAddress + offset + size
+            )
         }
     }
 }
@@ -48,20 +76,20 @@ extension ProtoPrinter {
         // Load commands start immediately after mach header
         let commandStartPtr = header.offset(bytes: MemoryLayout<mach_header_64>.size, as: load_command.self)
         let segmentStride = MemoryLayout<segment_command_64>.stride
-        
+
         for commandIndex in 0 ..< Int(header.pointee.ncmds) {
             let commandPtr = commandStartPtr.advanced(by: commandIndex)
-            
+
             // TODO: Support `LC_SEGMENT` (32 bit)?
             if commandPtr.pointee.cmd == LC_SEGMENT_64 {
                 // Rebind commandPtr to segment_command_64
                 let segmentCommand = commandPtr.offset(bytes: 0, as: segment_command_64.self)
-                
+
                 // Only look at segments matching the desired segment name
                 guard String(tuple: segmentCommand.pointee.segname) == segmentName else {
                     continue
                 }
-                
+
                 // Loop through the sections in the segment
                 let sectionsStartPtr = segmentCommand.offset(bytes: segmentStride, as: section_64.self)
                 for sectionIndex in 0 ..< Int(segmentCommand.pointee.nsects) {
@@ -75,86 +103,96 @@ extension ProtoPrinter {
         }
         return nil
     }
-    
-    private func printConformances(in sectionHeader: section_64, baseAddress: UnsafeRawPointer) {
+
+    private func printConformances(
+        in sectionHeader: section_64,
+        baseAddress: UnsafeRawPointer,
+        maxAddress: UnsafeRawPointer
+    ) {
         // Needed to loop over conformances
         let align = Int(pow(2, Double(sectionHeader.align)))
         let count = Int(sectionHeader.size) / align
-        
+
         for index in 0 ..< count {
             // Find address of the actual conformance
             let conformanceAddress = baseAddress.advanced(by: Int(sectionHeader.offset) + index * align)
             let conformanceOffset = conformanceAddress.assumingMemoryBound(to: Int32.self).pointee
-            
+
             // Address is relative to the location of address value itself
             let conformancePtr = conformanceAddress
                 .advanced(by: Int(conformanceOffset))
                 .assumingMemoryBound(to: ProtocolConformanceDescriptor.self)
-            
+
             let conformance = conformancePtr.pointee
-            
+
             let kind = conformance.flags.typeReferenceKind
             guard kind == .directTypeDescriptor || kind == .indirectTypeDescriptor else { continue }
-            
+
             guard conformance.protocolWitnessTable != 0 else {
-                // I don't know how to resolve these
+                // 🤷
                 continue
             }
-            
+
             let protocolPtr: UnsafePointer<ProtocolDescriptor>
-            
+
             // Low bit in `protocolDescriptor` signifies an indirect pointer. Indirect pointers
             // resolve to a new address that's an absolute relative to the base address
             if conformance.protocolDescriptor & 1 == 1 {
                 // Get rid of indirect signifier bit
                 let localOffset = Int(conformance.protocolDescriptor & ~1)
-                
+
                 let absoluteOffset = conformancePtr
                     .offset(bytes: localOffset, as: UInt32.self)
                     .pointee
-                
-                // Maybe builtin types? 🤷 Offsets too low don't resolve to proper descriptors
-                guard absoluteOffset > 0xFFFF else {
-                    continue
-                }
-                
+
                 protocolPtr = baseAddress
                     .advanced(by: Int(absoluteOffset))
                     .assumingMemoryBound(to: ProtocolDescriptor.self)
             } else {
                 protocolPtr = conformancePtr.following(\.protocolDescriptor)
             }
-            
+
             // Get pointer to type conforming to the protocol
             let typePtr: UnsafePointer<TargetContextDescriptor>
             switch kind {
             case .directTypeDescriptor:
                 typePtr = conformancePtr.following(\.nominalTypeDescriptor)
-                
+
             case .indirectTypeDescriptor:
                 // Same idea as indirect protocol pointer above
                 let localOffset = conformancePtr
                     .following(\.nominalTypeDescriptor, as: UInt32.self)
                     .pointee
-                
-                // Maybe builtin types? 🤷 Offsets too low don't resolve to proper descriptors
-                guard localOffset > 0xFFFF else { continue }
-                
+
                 typePtr = baseAddress
                     .advanced(by: Int(localOffset))
                     .assumingMemoryBound(to: TargetContextDescriptor.self)
-                
+
             case .directObjCClass, .indirectObjCClass:
                 // TODO: Support Objective-C classes?
                 continue
             }
-            
-            
-            // Check name of the protocol being conformed to
-            let typeName = typePtr.following(\.name, as: UInt8.self).asString()
-            let protocolName = protocolPtr.following(\.name, as: UInt8.self).asString()
 
-            print("\(typeName): \(protocolName)")
+            let typeNamePtr = typePtr.following(\.name, as: UInt8.self)
+            let typeName: String
+
+            if (baseAddress ..< maxAddress).contains(UnsafeRawPointer(typeNamePtr)) {
+                typeName = typeNamePtr.asString()
+            } else {
+                typeName = "Type out of bounds"
+            }
+
+            let protocolNamePtr = protocolPtr.following(\.name, as: UInt8.self)
+            let protocolName: String
+
+            if (baseAddress ..< maxAddress).contains(UnsafeRawPointer(protocolNamePtr)) {
+                protocolName = protocolNamePtr.asString()
+            } else {
+                protocolName = "Protocol out of bounds"
+            }
+
+            print("Type: \(typeName), Protocol: \(protocolName)")
+            print("")
         }
     }
 }
@@ -173,7 +211,7 @@ struct ProtocolConformanceDescriptor {
 extension ProtocolConformanceDescriptor {
     struct Flags {
         private let bits: UInt32
-        
+
         /// Whether or not the conformance descriptor's witness table pattern is
         /// used as a pattern or if it's served as the real witness table. This is
         /// most likely true when the conformance is about a generic type and false
@@ -182,12 +220,12 @@ extension ProtocolConformanceDescriptor {
         var hasGenericWitnessTable: Bool {
             bits & (0x1 << 17) != 0
         }
-        
+
         /// Whether or not this conformance has resilient witnesses.
         var hasResilientWitnesses: Bool {
             bits & (0x1 << 16) != 0
         }
-        
+
         /// Whether or not this conformance is retroactive. A conformance is
         /// considered retroactive when it happens in a module that is not the
         /// module the protocol was defined in and not the module the type conforming
@@ -195,13 +233,13 @@ extension ProtocolConformanceDescriptor {
         var isRetroactive: Bool {
             bits & (0x1 << 6) != 0
         }
-        
+
         /// Whether or not this conformance was synthesized non-uniquely. This
         /// happens when an imported C structure or such defines a Swift conformance.
         var isSynthesizedNonUnique: Bool {
             bits & (0x1 << 7) != 0
         }
-        
+
         /// The number of conditional requirements this conformance requires. This
         /// occurs with conditional conformance situations where a type only conforms
         /// if one/a few/all of its generic parameters conform to some protocol.
@@ -210,7 +248,7 @@ extension ProtocolConformanceDescriptor {
         var numConditionalRequirements: Int {
             Int(bits & (0xFF << 8)) >> 8
         }
-        
+
         /// The type reference kind to the type that is conforming to some protocol
         /// in this conformance.
         var typeReferenceKind: TypeReferenceKind {
@@ -223,13 +261,13 @@ extension ProtocolConformanceDescriptor {
 enum TypeReferenceKind: UInt16 {
     /// This is a direct relative reference to the type's context descriptor.
     case directTypeDescriptor = 0x0
-    
+
     /// This is an indirect relative reference to the type's context descriptor.
     case indirectTypeDescriptor = 0x1
-    
+
     /// This is a direct relative reference to some Objective-C class metadata.
     case directObjCClass = 0x2
-    
+
     /// This is an indirect relative reference to some Objective-C class metadata.
     case indirectObjCClass = 0x3
 }
@@ -237,12 +275,59 @@ enum TypeReferenceKind: UInt16 {
 // MARK: - ProtocolDescriptor
 
 struct ProtocolDescriptor {
-    let flags: UInt32
+    let flags: ContextDescriptorFlags
     let parent: Int32
     let name: Int32
     let numRequirementsInSignature: UInt32
     let numRequirements: UInt32
     let associatedTypeNames: Int32
+}
+
+public enum ContextDescriptorKind: Int {
+    case module = 0
+    case `extension` = 1
+    case anonymous = 2
+    case `protocol` = 3
+    case opaqueType = 4
+    case `class` = 16
+    case `struct` = 17
+    case `enum` = 18
+}
+
+/// The flags which describe a context descriptor.
+public struct ContextDescriptorFlags {
+    /// Flags as represented in bits.
+    public let bits: UInt32
+
+    /// The kind of context this descriptor is.
+    public var kind: ContextDescriptorKind {
+        return ContextDescriptorKind(rawValue: Int(bits) & 0x1F)!
+    }
+
+    /// Whether this context is "unique".
+    public var isUnique: Bool {
+        bits & 0x40 != 0
+    }
+
+    /// Whether or not this context is generic and has a generic context.
+    public var isGeneric: Bool {
+        bits & 0x80 != 0
+    }
+
+    /// The version number for this context descriptor.
+    public var version: UInt8 {
+        UInt8((bits >> 0x8) & 0xFF)
+    }
+
+    /// Whether the context has information about invertible protocols, which
+    /// will show up as a trailing field in the context descriptor.
+    var hasInvertibleProtocols: Bool {
+        (bits & 0x20) != 0;
+    }
+
+    var kindSpecificFlags: UInt16 {
+        UInt16((bits >> 0x10) & 0xFFFF)
+    }
 }
 
 // MARK: - TargetContextDescriptor
@@ -274,7 +359,7 @@ extension UnsafePointer {
             .advanced(by: offset)
             .assumingMemoryBound(to: destination)
     }
-    
+
     /// Get a new UnsafePointer by following an offset property that's bound to the expected destination type
     ///
     /// - Parameters:
